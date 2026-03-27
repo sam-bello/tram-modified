@@ -67,6 +67,8 @@ def detect_segment_track(imgfiles, out_path, thresh=0.5, min_size=None,
     masks_ = []
     boxes_ = []
     for t, imgpath in enumerate(tqdm(imgfiles)):
+        if t % 20 == 0:
+            torch.cuda.empty_cache()
         img_cv2 = cv2.imread(imgpath)
 
         ### --- Detection ---

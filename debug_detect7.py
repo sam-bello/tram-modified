@@ -1,14 +1,7 @@
+"""Exact copy of debug6 but with extra code after detection (not executed)"""
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__) + '/..')
-
-# Add CUDA DLL directories for Windows
-if sys.platform == 'win32':
-    conda_prefix = os.environ.get('CONDA_PREFIX', '')
-    for p in [os.path.join(conda_prefix, 'bin'),
-              os.path.join(conda_prefix, 'Library', 'bin')]:
-        if os.path.isdir(p):
-            os.add_dll_directory(p)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import argparse
@@ -19,34 +12,29 @@ from pycocotools import mask as masktool
 from lib.pipeline import video2frames, detect_segment_track, visualize_tram
 from lib.camera import run_metric_slam, calibrate_intrinsics, align_cam_to_world
 
-
 parser = argparse.ArgumentParser()
-parser.add_argument("--video", type=str, default='./example_video.mov', help='input video')
-parser.add_argument("--static_camera", action='store_true', help='whether the camera is static')
-parser.add_argument("--visualize_mask", action='store_true', help='save deva vos for visualization')
+parser.add_argument("--video", type=str, default='./example_video.mov')
+parser.add_argument("--static_camera", action='store_true')
+parser.add_argument("--visualize_mask", action='store_true')
 args = parser.parse_args()
 
-# File and folders
 file = args.video
-root = os.path.dirname(file)
 seq = os.path.basename(file).split('.')[0]
-
 seq_folder = f'results/{seq}'
 img_folder = f'{seq_folder}/images'
 os.makedirs(seq_folder, exist_ok=True)
 os.makedirs(img_folder, exist_ok=True)
 
-##### Extract Frames #####
 print('Extracting frames ...')
 nframes = video2frames(file, img_folder)
 
-##### Detection + SAM + DEVA-Track-Anything #####
 print('Detect, Segment, and Track ...')
 imgfiles = sorted(glob(f'{img_folder}/*.jpg'))
-boxes_, masks_, tracks_ = detect_segment_track(imgfiles, seq_folder, thresh=0.25, 
+boxes_, masks_, tracks_ = detect_segment_track(imgfiles, seq_folder, thresh=0.25,
                                                min_size=100, save_vos=args.visualize_mask)
+print(f'Detection complete! {len(boxes_)} frames processed')
 
-##### Run Masked DROID-SLAM #####
+# SLAM code below (will execute after detection)
 print('Masked Metric SLAM ...')
 masks = np.array([masktool.decode(m) for m in masks_])
 masks = torch.from_numpy(masks)
@@ -55,7 +43,7 @@ cam_int, is_static = calibrate_intrinsics(img_folder, masks, is_static=args.stat
 cam_R, cam_T = run_metric_slam(img_folder, masks=masks, calib=cam_int, is_static=is_static)
 wd_cam_R, wd_cam_T, spec_f = align_cam_to_world(imgfiles[0], cam_R, cam_T)
 
-camera = {'pred_cam_R': cam_R.numpy(), 'pred_cam_T': cam_T.numpy(), 
+camera = {'pred_cam_R': cam_R.numpy(), 'pred_cam_T': cam_T.numpy(),
           'world_cam_R': wd_cam_R.numpy(), 'world_cam_T': wd_cam_T.numpy(),
           'img_focal': cam_int[0], 'img_center': cam_int[2:], 'spec_focal': spec_f}
 
@@ -63,4 +51,4 @@ np.save(f'{seq_folder}/camera.npy', camera)
 np.save(f'{seq_folder}/boxes.npy', boxes_)
 np.save(f'{seq_folder}/masks.npy', masks_)
 np.save(f'{seq_folder}/tracks.npy', tracks_)
-
+print('Camera estimation complete!')
