@@ -24,6 +24,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--video", type=str, default='./example_video.mov', help='input video')
 parser.add_argument("--static_camera", action='store_true', help='whether the camera is static')
 parser.add_argument("--visualize_mask", action='store_true', help='save deva vos for visualization')
+parser.add_argument("--field_mode", action='store_true',
+                    help='use football field yard lines (1 yd apart) for metric scale and world alignment')
 args = parser.parse_args()
 
 # File and folders
@@ -52,12 +54,24 @@ masks = np.array([masktool.decode(m) for m in masks_])
 masks = torch.from_numpy(masks)
 
 cam_int, is_static = calibrate_intrinsics(img_folder, masks, is_static=args.static_camera)
-cam_R, cam_T = run_metric_slam(img_folder, masks=masks, calib=cam_int, is_static=is_static)
-wd_cam_R, wd_cam_T, spec_f = align_cam_to_world(imgfiles[0], cam_R, cam_T)
 
-camera = {'pred_cam_R': cam_R.numpy(), 'pred_cam_T': cam_T.numpy(), 
+if args.field_mode:
+    # --- Field mode: yard-line scale + field-plane alignment ---
+    from lib.pipeline.field_detection import run_field_metric_slam
+    print('Field mode: using yard lines for metric scale and world alignment')
+    cam_R, cam_T, wd_cam_R, wd_cam_T, _, _ = run_field_metric_slam(
+        img_folder, masks=masks, calib=cam_int, is_static=is_static)
+    spec_f = cam_int[0]  # no SPEC focal; use calibrated focal
+
+else:
+    # --- Original pipeline: ZoeDepth scale + SPEC gravity ---
+    cam_R, cam_T = run_metric_slam(img_folder, masks=masks, calib=cam_int, is_static=is_static)
+    wd_cam_R, wd_cam_T, spec_f = align_cam_to_world(imgfiles[0], cam_R, cam_T)
+
+camera = {'pred_cam_R': cam_R.numpy(), 'pred_cam_T': cam_T.numpy(),
           'world_cam_R': wd_cam_R.numpy(), 'world_cam_T': wd_cam_T.numpy(),
-          'img_focal': cam_int[0], 'img_center': cam_int[2:], 'spec_focal': spec_f}
+          'img_focal': cam_int[0], 'img_center': cam_int[2:], 'spec_focal': spec_f,
+          'field_mode': args.field_mode}
 
 np.save(f'{seq_folder}/camera.npy', camera)
 np.save(f'{seq_folder}/boxes.npy', boxes_)

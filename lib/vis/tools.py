@@ -214,6 +214,96 @@ def checkerboard_geometry(
     return vertices, faces, vert_colors, face_colors
 
 
+def football_field_geometry(
+    length=12.0,
+    field_color=[0.18, 0.55, 0.15],
+    line_color=[1.0, 1.0, 1.0],
+    tile_width=0.5,
+    yard_line_spacing=None,
+    alpha=1.0,
+    up="y",
+    c1=0.0,
+    c2=0.0,
+):
+    """
+    Generate a football field ground mesh with green surface and white yard lines.
+
+    :param length: total size of the field mesh
+    :param field_color: RGB color of the grass
+    :param line_color: RGB color of the yard lines
+    :param tile_width: size of each mesh tile
+    :param yard_line_spacing: spacing between yard lines in world units.
+           If None, auto-computed as length/20 (gives ~20 lines across the field).
+    :param alpha: opacity
+    :param up: "y" or "z" up axis
+    :param c1: center offset along first horizontal axis
+    :param c2: center offset along second horizontal axis (depth)
+    """
+    assert up == "y" or up == "z"
+
+    field_c = np.array(field_color + [alpha])
+    line_c = np.array(line_color + [alpha])
+
+    radius = length / 2.0
+    num_rows = num_cols = max(2, int(length / tile_width))
+
+    if yard_line_spacing is None:
+        yard_line_spacing = length / 20.0
+
+    # Line width as fraction of tile (thin white stripes)
+    line_half_width = tile_width * 0.3
+
+    vertices = []
+    vert_colors = []
+    faces = []
+    face_colors = []
+
+    for i in range(num_rows):
+        for j in range(num_cols):
+            u0, v0 = j * tile_width - radius, i * tile_width - radius
+            us = np.array([u0, u0, u0 + tile_width, u0 + tile_width])
+            vs = np.array([v0, v0 + tile_width, v0 + tile_width, v0])
+            zs = np.zeros(4)
+
+            if up == "y":
+                cur_verts = np.stack([us, zs, vs], axis=-1)
+                cur_verts[:, 0] += c1
+                cur_verts[:, 2] += c2
+            else:
+                cur_verts = np.stack([us, vs, zs], axis=-1)
+                cur_verts[:, 0] += c1
+                cur_verts[:, 1] += c2
+
+            cur_faces = np.array(
+                [[0, 1, 3], [1, 2, 3], [0, 3, 1], [1, 3, 2]], dtype=np.int64
+            )
+            cur_faces += 4 * (i * num_cols + j)
+
+            # Determine if this tile falls on a yard line
+            # Yard lines run perpendicular to the depth axis (along u direction)
+            # Check if tile center v-position aligns with a yard line
+            tile_center_v = v0 + tile_width / 2
+            # Distance to nearest yard line
+            nearest_line = round(tile_center_v / yard_line_spacing) * yard_line_spacing
+            dist_to_line = abs(tile_center_v - nearest_line)
+
+            is_line = dist_to_line < line_half_width
+            cur_color = line_c if is_line else field_c
+            cur_colors = np.array([cur_color] * 4)
+
+            vertices.append(cur_verts)
+            faces.append(cur_faces)
+            vert_colors.append(cur_colors)
+            face_colors.append(cur_colors)
+
+    vertices = np.concatenate(vertices, axis=0).astype(np.float32)
+    vert_colors = np.concatenate(vert_colors, axis=0).astype(np.float32)
+    faces = np.concatenate(faces, axis=0).astype(np.float32)
+    face_colors = np.concatenate(face_colors, axis=0).astype(np.float32)
+
+    return vertices, faces, vert_colors, face_colors
+
+
 def camera_marker_geometry(radius, height, up):
     assert up == "y" or up == "z"
     if up == "y":

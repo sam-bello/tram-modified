@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker 
 from scipy.ndimage import gaussian_filter
 
-from .tools import checkerboard_geometry
+from .tools import checkerboard_geometry, football_field_geometry
 from lib.models.smpl import SMPL
 from lib.utils.rotation_conversions import quaternion_to_matrix, matrix_to_quaternion
 
@@ -114,7 +114,43 @@ def get_floor_mesh(pred_vert_gr, z_start=0, z_end=-1, scale=1.5):
 
     v, f, vc, fc = checkerboard_geometry(length=scale, c1=cx, c2=cz, up="y")
     vc = vc[:, :3] * 255
-  
+
+    return [v, f, vc]
+
+
+def get_field_floor_mesh(pred_vert_gr, z_start=0, z_end=-1, scale=1.5,
+                         yard_line_spacing=None):
+    """
+    Return the geometry of a football field floor mesh with yard lines.
+
+    :param pred_vert_gr: (B, N, 3) ground-aligned vertices
+    :param z_start: start frame for Z centering
+    :param z_end: end frame for Z centering
+    :param scale: scale multiplier
+    :param yard_line_spacing: spacing between yard lines in world units.
+           If None, auto-computed from scene scale.
+    """
+    verts = pred_vert_gr.clone()
+
+    # Scale of the scene
+    sx, sz = (verts.mean(1).max(0)[0] - verts.mean(1).min(0)[0])[[0, 2]]
+    length = max(sx.item(), sz.item()) * scale
+
+    # Center X
+    cx = (verts.mean(1).max(0)[0] + verts.mean(1).min(0)[0])[[0]] / 2.0
+    cx = cx.item()
+
+    # Center Z
+    verts = verts[z_start:z_end]
+    cz = (verts.mean(1).max(0)[0] + verts.mean(1).min(0)[0])[[2]] / 2.0
+    cz = cz.item()
+
+    v, f, vc, fc = football_field_geometry(
+        length=length, c1=cx, c2=cz, up="y",
+        yard_line_spacing=yard_line_spacing
+    )
+    vc = vc[:, :3] * 255
+
     return [v, f, vc]
 
 def get_mesh_world(pred_smpl, pred_cam=None, scale=None):

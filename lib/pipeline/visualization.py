@@ -11,7 +11,8 @@ from lib.models.smpl import SMPL
 from lib.vis.renderer import Renderer
 
 
-def visualize_tram(seq_folder, floor_scale=2, bin_size=-1, max_faces_per_bin=30000):
+def visualize_tram(seq_folder, floor_scale=2, bin_size=-1, max_faces_per_bin=30000,
+                   field_mode=False):
     img_folder = f'{seq_folder}/images'
     hps_folder = f'{seq_folder}/hps'
     imgfiles = sorted(glob(f'{img_folder}/*.jpg'))
@@ -29,6 +30,35 @@ def visualize_tram(seq_folder, floor_scale=2, bin_size=-1, max_faces_per_bin=300
     track_tid = {i:[] for i in tstamp}
     locations = []
     lowest = []
+
+    # Find the track with the most frames and assign it bright red
+    track_lengths = []
+    for hf in hps_files:
+        ps = np.load(hf, allow_pickle=True).item()
+        track_lengths.append(len(ps['frame']))
+    primary_track = int(np.argmax(track_lengths))
+
+    PRIMARY_COLOR = torch.tensor([1.0, 0.0, 0.0])  # bright red
+    # Remove any color too close to red from the palette so others can't match
+    red_thresh = 0.3  # distance threshold
+    filtered_colors = []
+    for c in colors:
+        dist = torch.sqrt(((c[:3] - PRIMARY_COLOR) ** 2).sum())
+        if dist > red_thresh:
+            filtered_colors.append(c)
+    other_colors = torch.stack(filtered_colors)
+
+    # Build per-track color map: primary gets red, others get from filtered palette
+    track_colors = {}
+    other_idx = 0
+    for i in range(max_track):
+        if i == primary_track:
+            track_colors[i] = PRIMARY_COLOR
+        else:
+            track_colors[i] = other_colors[other_idx % len(other_colors)][:3]
+            other_idx += 1
+
+    print(f'Primary track: {primary_track} ({track_lengths[primary_track]} frames) -> RED')
 
     ##### TRAM + VIMO #####
     pred_cam = np.load(f'{seq_folder}/camera.npy', allow_pickle=True).item()
@@ -87,12 +117,21 @@ def visualize_tram(seq_folder, floor_scale=2, bin_size=-1, max_faces_per_bin=300
     view_cam_T  = - torch.einsum('bij,bj->bi', world_cam_R, world_cam_T).to('cuda')
 
     ##### Render video for visualization #####
-    writer = imageio.get_writer(f'{seq_folder}/tram_output.mp4', fps=30, mode='I', 
+    writer = imageio.get_writer(f'{seq_folder}/tram_output.mp4', fps=30, mode='I',
                                 format='FFMPEG', macro_block_size=1)
     img = cv2.imread(imgfiles[0])
-    renderer = Renderer(img.shape[1], img.shape[0], img_focal-100, 'cuda', 
+    renderer = Renderer(img.shape[1], img.shape[0], img_focal-100, 'cuda',
                         smpl.faces, bin_size=bin_size, max_faces_per_bin=max_faces_per_bin)
-    renderer.set_ground(scale, cx.item(), cz.item())
+
+    if field_mode:
+        # Render green field with white yard lines instead of checkerboard
+        from lib.pipeline.field_detection import YARD_IN_METERS
+        # Auto yard-line spacing: scale / 20 gives roughly 20 lines across scene
+        yard_line_spacing = scale / 20.0
+        renderer.set_field_ground(scale, cx.item(), cz.item(),
+                                  yard_line_spacing=yard_line_spacing)
+    else:
+        renderer.set_ground(scale, cx.item(), cz.item())
 
     for i in tqdm(range(len(imgfiles))):
         img = cv2.imread(imgfiles[i])[:,:,::-1]
@@ -103,7 +142,7 @@ def visualize_tram(seq_folder, floor_scale=2, bin_size=-1, max_faces_per_bin=300
             verts_list -= offset
             
             tid = track_tid[i]
-            verts_colors = torch.stack([colors[t] for t in tid]).to('cuda')
+            verts_colors = torch.stack([track_colors[t] for t in tid]).to('cuda')
 
         faces = renderer.faces.clone().squeeze(0)
         cameras, lights = renderer.create_camera_from_cv(view_cam_R[[i]], 

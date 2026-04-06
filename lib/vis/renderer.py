@@ -19,7 +19,7 @@ from pytorch3d.structures.meshes import join_meshes_as_scene
 from pytorch3d.renderer.cameras import look_at_rotation
 from pytorch3d.renderer.camera_conversions import _cameras_from_opencv_projection
 
-from .tools import get_colors, checkerboard_geometry
+from .tools import get_colors, checkerboard_geometry, football_field_geometry
 
 
 def overlay_image_onto_background(image, mask, bbox, background):
@@ -190,6 +190,16 @@ class Renderer():
     def set_ground(self, length, center_x, center_z):
         device = self.device
         v, f, vc, fc = map(torch.from_numpy, checkerboard_geometry(length=length, c1=center_x, c2=center_z, up="y"))
+        v, f, vc = v.to(device), f.to(device), vc.to(device)
+        self.ground_geometry = [v, f, vc]
+
+    def set_field_ground(self, length, center_x, center_z, yard_line_spacing=None):
+        """Set ground geometry as a football field with yard lines."""
+        device = self.device
+        v, f, vc, fc = map(torch.from_numpy, football_field_geometry(
+            length=length, c1=center_x, c2=center_z, up="y",
+            yard_line_spacing=yard_line_spacing
+        ))
         v, f, vc = v.to(device), f.to(device), vc.to(device)
         self.ground_geometry = [v, f, vc]
 
