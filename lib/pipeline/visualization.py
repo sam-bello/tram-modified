@@ -31,35 +31,6 @@ def visualize_tram(seq_folder, floor_scale=2, bin_size=-1, max_faces_per_bin=300
     locations = []
     lowest = []
 
-    # Find the track with the most frames and assign it bright red
-    track_lengths = []
-    for hf in hps_files:
-        ps = np.load(hf, allow_pickle=True).item()
-        track_lengths.append(len(ps['frame']))
-    primary_track = int(np.argmax(track_lengths))
-
-    PRIMARY_COLOR = torch.tensor([1.0, 0.0, 0.0])  # bright red
-    # Remove any color too close to red from the palette so others can't match
-    red_thresh = 0.3  # distance threshold
-    filtered_colors = []
-    for c in colors:
-        dist = torch.sqrt(((c[:3] - PRIMARY_COLOR) ** 2).sum())
-        if dist > red_thresh:
-            filtered_colors.append(c)
-    other_colors = torch.stack(filtered_colors)
-
-    # Build per-track color map: primary gets red, others get from filtered palette
-    track_colors = {}
-    other_idx = 0
-    for i in range(max_track):
-        if i == primary_track:
-            track_colors[i] = PRIMARY_COLOR
-        else:
-            track_colors[i] = other_colors[other_idx % len(other_colors)][:3]
-            other_idx += 1
-
-    print(f'Primary track: {primary_track} ({track_lengths[primary_track]} frames) -> RED')
-
     ##### TRAM + VIMO #####
     pred_cam = np.load(f'{seq_folder}/camera.npy', allow_pickle=True).item()
     img_focal = pred_cam['img_focal'].item()
@@ -142,7 +113,7 @@ def visualize_tram(seq_folder, floor_scale=2, bin_size=-1, max_faces_per_bin=300
             verts_list -= offset
             
             tid = track_tid[i]
-            verts_colors = torch.stack([track_colors[t] for t in tid]).to('cuda')
+            verts_colors = torch.stack([colors[t] for t in tid]).to('cuda')
 
         faces = renderer.faces.clone().squeeze(0)
         cameras, lights = renderer.create_camera_from_cv(view_cam_R[[i]], 

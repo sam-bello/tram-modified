@@ -1,12 +1,14 @@
 """
 Football field detection and yard-line based ground plane estimation.
 
-Detects the green field surface and white yard-line hash marks to:
+Detects the green field surface and the long white yard-line stripes to:
 1. Estimate metric scale from yard line spacing (replaces ZoeDepth)
 2. Estimate gravity/world alignment from the field plane (replaces SPEC)
 3. Provide a field-textured ground mesh for visualization
 
-Hash marks are 1 yard (0.9144 m) apart.
+Major yard lines (the long stripes that cross the full field width) are 5 yards
+(4.572 m) apart.  Hash marks (short tick marks in the middle third of the field)
+are filtered out so only the 5-yard stripes are used for scale estimation.
 """
 
 import cv2
@@ -18,7 +20,11 @@ from tqdm import tqdm
 YARD_IN_METERS = 0.9144
 FIELD_LENGTH_YARDS = 100  # between end zones
 FIELD_WIDTH_YARDS = 53.33
-YARD_LINE_SPACING_YARDS = 1  # hash marks every 1 yard
+YARD_LINE_SPACING_YARDS = 5  # major yard lines every 5 yards
+
+# Training hoops placed on the field for drill work
+HOOP_DIAMETER_FEET = 12
+HOOP_DIAMETER_METERS = HOOP_DIAMETER_FEET * 0.3048  # 3.6576 m
 
 
 # ---------------------------------------------------------------------------
@@ -147,13 +153,93 @@ def cluster_yard_lines(lines, dominant_angle, min_gap_px=10):
     return np.array(clusters), perp_dir
 
 
-def compute_yard_line_spacing_pixels(lines, dominant_angle):
+def filter_long_yard_lines(lines, dominant_angle, positions, perp_dir, image_width,
+                            min_span_ratio=0.50, max_lines=5, min_spacing_px=110,
+                            min_coverage_ratio=0.35):
+    """
+    Keep only yard-line clusters that look like continuous stripes, not
+    scattered hash marks, up to *max_lines* results.
+
+    Three filters are applied per cluster:
+    1. **Span** — total extent along the line direction must be ≥
+       *min_span_ratio* × image_width (rejects short marks).
+    2. **Coverage** — sum of individual segment lengths / total span must be ≥
+       *min_coverage_ratio* (rejects hash marks whose combined span is large
+       but whose segments are separated by wide gaps).
+    3. **Spacing** — each kept line must be ≥ *min_spacing_px* from every
+       other kept line on the perpendicular axis.
+
+    Candidates that pass filters 1 & 2 are ranked by coverage ratio
+    (most continuous first), then selected greedily with the spacing constraint.
+
+    :param lines: (N, 4) line segments from detect_yard_lines
+    :param dominant_angle: dominant line angle in radians
+    :param positions: 1-D cluster positions from cluster_yard_lines
+    :param perp_dir: perpendicular unit vector from cluster_yard_lines
+    :param image_width: width of the source image in pixels
+    :param min_span_ratio: minimum span / image_width (default 0.50)
+    :param max_lines: maximum lines to return (default 5)
+    :param min_spacing_px: minimum distance between kept lines in px (default 110)
+    :param min_coverage_ratio: minimum covered_length / span (default 0.35)
+    :returns: filtered 1-D array of cluster positions (sorted by perp position)
+    """
+    if len(positions) == 0 or perp_dir is None or len(lines) == 0:
+        return positions
+
+    line_dir = np.array([np.cos(dominant_angle), np.sin(dominant_angle)])
+    mids = (lines[:, :2] + lines[:, 2:]) / 2.0
+    proj_perp = mids @ perp_dir
+
+    min_span = min_span_ratio * image_width
+    scored = []  # (coverage_ratio, position)
+    for pos in positions:
+        mask = np.abs(proj_perp - pos) < 15
+        if mask.sum() == 0:
+            continue
+        segs = lines[mask]
+
+        # Total span: leftmost to rightmost projected endpoint
+        all_pts = np.vstack([segs[:, :2], segs[:, 2:]])  # (2N, 2)
+        proj_along = all_pts @ line_dir
+        span = float(proj_along.max() - proj_along.min())
+        if span < min_span:
+            continue
+
+        # Coverage: sum of each segment's projected length
+        p0 = segs[:, :2] @ line_dir
+        p1 = segs[:, 2:] @ line_dir
+        covered = float(np.abs(p1 - p0).sum())
+        coverage_ratio = covered / span
+        if coverage_ratio < min_coverage_ratio:
+            continue
+
+        scored.append((coverage_ratio, pos))
+
+    if not scored:
+        return np.array([])
+
+    # Greedy selection: most-continuous lines first, enforce min spacing
+    scored.sort(key=lambda x: -x[0])
+    kept_pos = []
+    for _, pos in scored:
+        if all(abs(pos - k) >= min_spacing_px for k in kept_pos):
+            kept_pos.append(pos)
+        if len(kept_pos) == max_lines:
+            break
+
+    return np.array(sorted(kept_pos))
+
+
+def compute_yard_line_spacing_pixels(lines, dominant_angle, positions=None):
     """
     Median pixel spacing between adjacent detected yard lines.
 
+    :param positions: pre-computed (and optionally pre-filtered) cluster positions;
+                      if None, cluster_yard_lines is called internally.
     :returns: spacing in pixels, or None if fewer than 2 distinct lines
     """
-    positions, _ = cluster_yard_lines(lines, dominant_angle)
+    if positions is None:
+        positions, _ = cluster_yard_lines(lines, dominant_angle)
     if len(positions) < 2:
         return None
 
@@ -164,6 +250,172 @@ def compute_yard_line_spacing_pixels(lines, dominant_angle):
     # Filter to gaps close to the median (within 50 %) to remove outliers
     near = gaps[(gaps > median_gap * 0.5) & (gaps < median_gap * 1.5)]
     return float(np.median(near)) if len(near) > 0 else float(median_gap)
+
+
+# ---------------------------------------------------------------------------
+# Hoop (circular marker) detection and scale estimation
+# ---------------------------------------------------------------------------
+
+def detect_hoops(image, field_mask=None, max_hoops=2,
+                 min_contour_area=300, max_contour_area=60000,
+                 min_aspect=0.08, min_semi_major=40,
+                 overlap_thresh=0.8):
+    """
+    Detect red training hoops lying flat on the football field.
+
+    Hoops laid flat appear as *ellipses* (foreshortened circles) rather than
+    perfect circles.  Detection uses red HSV segmentation + contour fitting:
+
+    1. Build a red-pixel mask (HSV hue 0-10 and 160-180).
+    2. Find contours within the field region.
+    3. Fit an ellipse to each large-enough red contour.
+    4. Reject ellipses whose semi-major axis is < min_semi_major (removes
+       small red objects like shirt logos).
+    5. Apply distance-based NMS: if two ellipse centres are within
+       overlap_thresh × semi_major of the larger ellipse, keep only the
+       larger one (removes duplicate detections of the same hoop).
+    6. Return the *max_hoops* largest surviving candidates.
+
+    For a flat circle the major axis of the projected ellipse equals the
+    true diameter (no foreshortening along that axis).
+
+    :param image: BGR image (H, W, 3)
+    :param field_mask: optional uint8 mask restricting detection to field region
+    :param max_hoops: maximum detections to return (default 2)
+    :param min_contour_area: minimum contour area in px² (filters tiny noise)
+    :param max_contour_area: maximum contour area in px² (filters large blobs)
+    :param min_aspect: minimum minor/major ratio; very flat shapes are noise
+    :param min_semi_major: minimum semi-major axis in pixels; filters small
+                           objects such as shirt logos (default 40 px)
+    :param overlap_thresh: NMS distance threshold as a fraction of the larger
+                           ellipse's semi-major axis (default 0.8)
+    :returns: (N, 5) float32 array of
+              [cx, cy, half_w, half_h, angle_deg], N ≤ max_hoops.
+              (half_w, half_h, angle) match cv2.fitEllipse / cv2.ellipse order.
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # Red wraps in HSV: low hue 0-10, high hue 160-180
+    red_lo = cv2.inRange(hsv, np.array([0,   80, 60]), np.array([10,  255, 255]))
+    red_hi = cv2.inRange(hsv, np.array([160, 80, 60]), np.array([180, 255, 255]))
+    red_mask = cv2.bitwise_or(red_lo, red_hi)
+
+    if field_mask is not None:
+        red_mask = cv2.bitwise_and(red_mask, field_mask)
+
+    # Close gaps in the ring, remove speckle
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, k_close)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN,  k_open)
+
+    contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    candidates = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_contour_area or area > max_contour_area:
+            continue
+        if len(cnt) < 5:  # fitEllipse needs >= 5 points
+            continue
+
+        (cx, cy), (w, h), angle = cv2.fitEllipse(cnt)
+        half_w, half_h = w / 2.0, h / 2.0
+        semi_major = max(half_w, half_h)
+
+        if semi_major < min_semi_major:
+            continue
+        if (min(half_w, half_h) / semi_major) < min_aspect:
+            continue
+
+        # Store (cx, cy, half_w, half_h, angle) — axis order matches
+        # cv2.fitEllipse output so cv2.ellipse can consume it directly.
+        candidates.append((area, cx, cy, half_w, half_h, angle))
+
+    if not candidates:
+        return np.zeros((0, 5), dtype=np.float32)
+
+    # Sort largest-first so NMS always keeps the bigger detection
+    candidates.sort(key=lambda x: -x[0])
+
+    # Distance-based NMS: suppress smaller ellipses that overlap a larger one
+    kept = []
+    for cand in candidates:
+        _, cx_c, cy_c, hw_c, hh_c, _ = cand
+        semi_c = max(hw_c, hh_c)
+        suppressed = False
+        for _, cx_k, cy_k, hw_k, hh_k, _ in kept:
+            dist = np.hypot(cx_c - cx_k, cy_c - cy_k)
+            if dist < overlap_thresh * max(semi_c, max(hw_k, hh_k)):
+                suppressed = True
+                break
+        if not suppressed:
+            kept.append(cand)
+        if len(kept) == max_hoops:
+            break
+
+    return np.array([[cx, cy, hw, hh, ang]
+                     for _, cx, cy, hw, hh, ang in kept],
+                    dtype=np.float32)
+
+
+def est_scale_from_hoops(slam_depth, image, calib, field_mask=None):
+    """
+    Estimate metric scale from detected circular training hoops of known
+    diameter HOOP_DIAMETER_METERS (12 ft = 3.6576 m).
+
+    For each detected circle the SLAM depth at the centre is sampled and
+    the projected physical diameter at that depth is computed; the scale
+    factor is derived as  scale = HOOP_DIAMETER_METERS / diameter_slam.
+
+    :param slam_depth: (H_slam, W_slam) SLAM depth map (1/disparity)
+    :param image: BGR image at original resolution
+    :param calib: [fx, fy, cx, cy] at SLAM resolution
+    :param field_mask: optional field mask at original-image resolution
+    :returns: scale float or None
+    """
+    hoops = detect_hoops(image, field_mask)
+    if len(hoops) == 0:
+        return None
+
+    fx, fy, *_ = calib[:4]
+    H_slam, W_slam = slam_depth.shape
+    H_img, W_img = image.shape[:2]
+    sx = W_slam / W_img
+    sy = H_slam / H_img
+    f_avg = (fx + fy) / 2.0
+
+    scales = []
+    for hoop in hoops:
+        cx_px, cy_px = hoop[0], hoop[1]
+        # half_w / half_h are in fitEllipse axis order; true semi-major is the larger
+        semi_major_px = max(hoop[2], hoop[3])
+        u_slam = int(np.clip(cx_px * sx, 0, W_slam - 1))
+        v_slam = int(np.clip(cy_px * sy, 0, H_slam - 1))
+
+        # Sample a patch around the hoop centre for robust depth
+        pr = max(3, int(semi_major_px * sx * 0.2))
+        patch = slam_depth[
+            max(0, v_slam - pr):v_slam + pr + 1,
+            max(0, u_slam - pr):u_slam + pr + 1,
+        ]
+        patch = patch[(patch > 0) & np.isfinite(patch)]
+        if len(patch) == 0:
+            continue
+        z = float(np.median(patch))
+
+        # For a flat circle the major axis = true diameter (no foreshortening).
+        # Convert major axis from image pixels to SLAM-depth pixels, then to
+        # physical SLAM units via pinhole:  length = px_slam * z / f
+        diameter_slam = (semi_major_px * 2.0 * sx) * z / f_avg
+        if diameter_slam < 1e-6:
+            continue
+
+        scales.append(HOOP_DIAMETER_METERS / diameter_slam)
+
+    if len(scales) == 0:
+        return None
+    return float(np.median(scales))
 
 
 # ---------------------------------------------------------------------------
@@ -193,14 +445,17 @@ def estimate_field_scale(image, field_mask=None):
     result['yard_lines'] = lines
     result['yard_line_angle'] = dominant_angle
 
-    positions, _ = cluster_yard_lines(lines, dominant_angle)
+    positions, perp_dir = cluster_yard_lines(lines, dominant_angle)
+    # Keep only the long 5-yard stripes; drop short hash marks
+    positions = filter_long_yard_lines(lines, dominant_angle, positions, perp_dir,
+                                        image.shape[1])
     result['line_positions'] = positions
 
-    spacing = compute_yard_line_spacing_pixels(lines, dominant_angle)
+    spacing = compute_yard_line_spacing_pixels(lines, dominant_angle, positions=positions)
     if spacing is None:
         return result
 
-    # Each gap = YARD_LINE_SPACING_YARDS yards
+    # Each gap = YARD_LINE_SPACING_YARDS yards (5-yard major lines)
     result['pixels_per_yard'] = spacing / YARD_LINE_SPACING_YARDS
     result['valid'] = True
     return result
@@ -237,66 +492,77 @@ def est_scale_from_field(slam_depth, image, calib, human_mask=None):
 
     lines, dominant_angle = detect_yard_lines(image, field_mask)
     positions, perp_dir = cluster_yard_lines(lines, dominant_angle)
+    # Keep only long 5-yard stripes
+    positions = filter_long_yard_lines(lines, dominant_angle, positions, perp_dir,
+                                        image.shape[1])
     if len(positions) < 2 or perp_dir is None:
         return None
 
     fx, fy, cx, cy = calib[:4]
     H_slam, W_slam = slam_depth.shape
     H_img, W_img = image.shape[:2]
+    sx = W_slam / W_img
+    sy = H_slam / H_img
 
-    # We will back-project the centre of each yard-line cluster into 3-D
-    # using SLAM depth, then measure the 3-D gap between adjacent lines.
     line_along = np.array([np.cos(dominant_angle), np.sin(dominant_angle)])
+    mids = (lines[:, :2] + lines[:, 2:]) / 2.0
+    proj_perp  = mids @ perp_dir
+    proj_along = mids @ line_along
+
+    def _backproject(px, py):
+        """Back-project image pixel (px, py) using SLAM depth; returns 3-D point or None."""
+        u = int(np.clip(px * sx, 0, W_slam - 1))
+        v = int(np.clip(py * sy, 0, H_slam - 1))
+        r = 3
+        patch = slam_depth[max(0, v - r):v + r + 1, max(0, u - r):u + r + 1]
+        patch = patch[(patch > 0) & np.isfinite(patch)]
+        if len(patch) == 0:
+            return None
+        z = float(np.median(patch))
+        X = (px * sx - cx) / fx * z
+        Y = (py * sy - cy) / fy * z
+        return np.array([X, Y, z])
 
     scales = []
     for i in range(len(positions) - 1):
         p0 = positions[i]
         p1 = positions[i + 1]
 
-        # Representative image pixel for each line (intersection of
-        # perpendicular projection position and the line direction, taken
-        # at the centre of the field mask along the line direction).
-        for pos, label in [(p0, 'a'), (p1, 'b')]:
-            # pixel = perp_dir * pos  + line_along * t  → pick t at image centre
-            # We need a concrete pixel; use the midpoint of line segments in
-            # the cluster.  Approximate: take the mean midpoint of segments
-            # whose projection is near *pos*.
-            mids = (lines[:, :2] + lines[:, 2:]) / 2.0
-            proj = mids @ perp_dir
-            close = np.abs(proj - pos) < 15  # pixels
-            if close.sum() == 0:
-                break
-            px, py = mids[close].mean(axis=0)
+        close_a = np.abs(proj_perp - p0) < 15
+        close_b = np.abs(proj_perp - p1) < 15
+        if close_a.sum() == 0 or close_b.sum() == 0:
+            continue
 
-            # Map from original-image coords to SLAM-depth coords
-            sx = W_slam / W_img
-            sy = H_slam / H_img
-            u_slam = int(np.clip(px * sx, 0, W_slam - 1))
-            v_slam = int(np.clip(py * sy, 0, H_slam - 1))
+        # Sample both points at the same along-line coordinate so the 3-D
+        # vector (pt_b - pt_a) is perpendicular to the yard lines with no
+        # spurious lateral component.  Use the midpoint of the along-line
+        # overlap region shared by both clusters; fall back to the mean of
+        # both clusters' along-line extents if they don't overlap.
+        a_along = proj_along[close_a]
+        b_along = proj_along[close_b]
+        t_lo = max(a_along.min(), b_along.min())
+        t_hi = min(a_along.max(), b_along.max())
+        t_ref = (t_lo + t_hi) / 2.0 if t_lo < t_hi \
+                else (a_along.mean() + b_along.mean()) / 2.0
 
-            # Sample a small patch of SLAM depth for robustness
-            r = 3
-            patch = slam_depth[max(0, v_slam - r):v_slam + r + 1,
-                               max(0, u_slam - r):u_slam + r + 1]
-            patch = patch[(patch > 0) & np.isfinite(patch)]
-            if len(patch) == 0:
-                break
-            z = float(np.median(patch))
+        # Pixel coordinates for each line at t_ref
+        px_a = t_ref * line_along[0] + p0 * perp_dir[0]
+        py_a = t_ref * line_along[1] + p0 * perp_dir[1]
+        px_b = t_ref * line_along[0] + p1 * perp_dir[0]
+        py_b = t_ref * line_along[1] + p1 * perp_dir[1]
 
-            # Back-project to camera 3-D
-            X = (px * sx - cx) / fx * z
-            Y = (py * sy - cy) / fy * z
-            if label == 'a':
-                pt_a = np.array([X, Y, z])
-            else:
-                pt_b = np.array([X, Y, z])
-        else:
-            # Both points computed successfully
-            dist_slam = np.linalg.norm(pt_b - pt_a)
-            if dist_slam < 1e-6:
-                continue
-            dist_metric = YARD_LINE_SPACING_YARDS * YARD_IN_METERS
-            scales.append(dist_metric / dist_slam)
+        pt_a = _backproject(px_a, py_a)
+        pt_b = _backproject(px_b, py_b)
+        if pt_a is None or pt_b is None:
+            continue
+
+        # The distance between the two co-aligned points is the perpendicular
+        # spacing between adjacent yard lines = YARD_LINE_SPACING_YARDS yards.
+        dist_slam = np.linalg.norm(pt_b - pt_a)
+        if dist_slam < 1e-6:
+            continue
+        dist_metric = YARD_LINE_SPACING_YARDS * YARD_IN_METERS
+        scales.append(dist_metric / dist_slam)
 
     if len(scales) == 0:
         return None
@@ -305,7 +571,166 @@ def est_scale_from_field(slam_depth, image, calib, human_mask=None):
 
 
 # ---------------------------------------------------------------------------
-# Field-based world alignment  (replaces SPEC gravity in align_cam_to_world)
+# Pitch / roll estimation from yard-line perspective convergence
+# ---------------------------------------------------------------------------
+
+def estimate_pitch_from_yard_lines(image, calib):
+    """
+    Estimate camera pitch purely from the perspective convergence of detected
+    yard lines — no SLAM depth required.
+
+    Yard lines are equally-spaced (5 yards) parallel lines on the ground.
+    Viewed from an elevated camera they converge toward a vanishing point V
+    whose position encodes the camera's downward tilt:
+
+        pitch = arctan( (c_perp - V) / f_perp )
+
+    where c_perp is the principal-point coordinate projected onto the
+    direction perpendicular to the yard lines, and f_perp is the effective
+    focal length in that direction.
+
+    The algorithm fits a 1-D projective transform
+
+        p_k = (a·k + b) / (c·k + 1)   for k = 0, 1, …, N-1
+
+    to the perpendicular-axis positions of N detected yard-line clusters
+    (sorted near-to-far, i.e. decreasing p).  The vanishing point is V = a/c,
+    which is correctly extrapolated even when V lies above the image.
+
+    Note: optical-axis roll is intentionally not estimated here because
+    cam_wrt_world expects SPEC-convention "roll" (heading about gravity Y),
+    not camera roll.  SPEC supplies that value separately.
+
+    :param image:  BGR image (H, W, 3)
+    :param calib:  [fx, fy, cx, cy] at the image's resolution
+    :returns: pitch_deg (float) or None on failure
+    """
+    fx, fy, cx, cy = calib[:4]
+
+    field_mask, found = detect_field_mask(image)
+    if not found:
+        return None
+
+    lines, dominant_angle = detect_yard_lines(image, field_mask)
+    if lines is None or len(lines) == 0:
+        return None
+
+    # Cluster then filter to major yard lines (removes hash marks)
+    positions, perp_dir = cluster_yard_lines(lines, dominant_angle)
+    if perp_dir is None:
+        return None
+    positions = filter_long_yard_lines(lines, dominant_angle, positions, perp_dir,
+                                       image.shape[1])
+    if len(positions) < 3:
+        return None
+
+    # Sort near-to-far: for a forward-looking camera, near yard lines project
+    # to larger perpendicular-axis values (lower in image), so sort descending.
+    positions = np.sort(positions)[::-1].copy()   # descending = near → far
+    N = len(positions)
+    ks = np.arange(N, dtype=float)
+
+    # Linearise the projective model:
+    #   p_k · (c·k + 1) = a·k + b
+    #   ⟹  a·k  −  c·p_k·k  +  b  =  p_k
+    #   ⟹  [k, −p_k·k, 1] · [a, c, b]ᵀ = p_k
+    A = np.column_stack([ks, -positions * ks, np.ones(N)])
+    result, _, _, _ = np.linalg.lstsq(A, positions, rcond=None)
+    a_coeff, c_coeff, _ = result
+
+    if abs(c_coeff) < 1e-9:
+        return None
+
+    vp = a_coeff / c_coeff   # vanishing-point position on perpendicular axis
+
+    # Principal-point and effective focal length projected onto perp_dir
+    px, py = float(perp_dir[0]), float(perp_dir[1])
+    c_perp = cx * px + cy * py
+    # For a calibrated camera the effective focal length along perp_dir is:
+    #   f_perp ≈ sqrt( (fx·px)² + (fy·py)² )
+    f_perp = float(np.sqrt((fx * px) ** 2 + (fy * py) ** 2))
+    if f_perp < 1.0:
+        f_perp = float(fy)   # fallback for degenerate perp_dir
+
+    pitch_rad = np.arctan2(c_perp - vp, f_perp)
+    pitch_deg = float(np.degrees(pitch_rad))
+
+    # Only return pitch — roll (optical-axis tilt) is not used here.
+    # cam_wrt_world expects SPEC-convention "roll" = heading rotation about
+    # the gravity Y-axis, which is completely different from the optical roll
+    # visible in yard line tilt.  We let SPEC supply that value separately.
+    return pitch_deg
+
+
+def align_cam_via_yard_lines(imgfiles, cam_R, cam_T, calib, sample_frames=15):
+    """
+    World-align a SLAM trajectory using camera pitch inferred from the
+    perspective convergence of yard lines, combined with SPEC for heading.
+
+    SPEC's pitch estimate is unreliable for high-angle cameras, but its
+    heading ("roll" in SPEC convention = rotation about gravity Y) is
+    correct.  This function:
+      1. Runs SPEC on the first frame to get the heading rotation.
+      2. Estimates pitch from yard-line vanishing point (more accurate for
+         high-angle / nearly-static football cameras).
+      3. Rebuilds R_wc with the corrected pitch but SPEC's heading.
+
+    Falls back to pure SPEC if too few yard lines are detected.
+
+    :param imgfiles:      sorted list of image paths (full sequence)
+    :param cam_R:         (T, 3, 3) SLAM camera rotations  (camera-to-world)
+    :param cam_T:         (T, 3)   SLAM camera translations (metric-scaled)
+    :param calib:         [fx, fy, cx, cy] at original image resolution
+    :param sample_frames: how many frames to sample for robust pitch estimation
+    :returns: world_cam_R (T, 3, 3), world_cam_T (T, 3), R_wc (3, 3)
+    """
+    from lib.camera.est_gravity import run_spec, cam_wrt_world
+
+    # --- Step 1: SPEC for heading (spec_roll = rotation about gravity Y-axis) ---
+    # spec_pitch and spec_roll are in radians.
+    _, spec_pitch_rad, spec_roll_rad = run_spec(imgfiles[0])
+
+    # --- Step 2: yard-line vanishing-point pitch (returned in degrees) ---
+    T_total = len(imgfiles)
+    indices = np.linspace(0, T_total - 1, min(sample_frames, T_total), dtype=int)
+
+    pitches_deg = []
+    for i in indices:
+        img = cv2.imread(imgfiles[i])
+        if img is None:
+            continue
+        p = estimate_pitch_from_yard_lines(img, calib)
+        if p is not None:
+            pitches_deg.append(p)
+
+    if len(pitches_deg) < 3:
+        print('  Yard-line pitch: too few detections, keeping SPEC pitch '
+              f'({np.degrees(spec_pitch_rad):.1f}°).')
+        effective_pitch_rad = spec_pitch_rad
+    else:
+        yard_pitch_deg = float(np.median(pitches_deg))
+        print(f'  Yard-line pitch: {yard_pitch_deg:.1f}°  (n={len(pitches_deg)}, '
+              f'SPEC was {np.degrees(spec_pitch_rad):.1f}°)')
+        effective_pitch_rad = np.radians(yard_pitch_deg)
+
+    # --- Step 3: R_wc with yard-line pitch + SPEC heading ---
+    R_wc = cam_wrt_world(effective_pitch_rad, spec_roll_rad)
+
+    if torch.is_tensor(cam_R):
+        world_cam_R = torch.einsum('ij,bjk->bik', R_wc, cam_R)
+        world_cam_T = torch.einsum('ij,bj->bi',   R_wc, cam_T)
+    else:
+        R_np = R_wc.numpy()
+        world_cam_R = torch.from_numpy(
+            np.einsum('ij,bjk->bik', R_np, cam_R)).float()
+        world_cam_T = torch.from_numpy(
+            np.einsum('ij,bj->bi',   R_np, cam_T)).float()
+
+    return world_cam_R, world_cam_T, R_wc
+
+
+# ---------------------------------------------------------------------------
+# Field-based world alignment  (SLAM-depth plane fitting — legacy)
 # ---------------------------------------------------------------------------
 
 def get_field_ground_points(image, field_mask, slam_depth, calib):
@@ -493,6 +918,14 @@ def align_cam_to_field(imgfiles, cam_R, cam_T, calib, droid_disps, droid_tstamp,
         world_cam_R = torch.from_numpy(np.einsum('ij,bjk->bik', R_np, cam_R)).float()
         world_cam_T = torch.from_numpy(np.einsum('ij,bj->bi', R_np, cam_T)).float()
 
+    # Shift the world origin to the field plane so the ground is at Y = 0.
+    # After rotation, the fitted field plane passes through R_field @ mean at
+    # some Y offset — without this shift the camera sits at the SLAM origin
+    # (often near Y = 0) while the field is above or below it.
+    field_center = torch.from_numpy(mean.squeeze()).float()
+    field_y = (R_field @ field_center)[1]   # Y of the field plane in world frame
+    world_cam_T[:, 1] -= field_y            # translate so field is at Y = 0
+
     return world_cam_R, world_cam_T, R_field
 
 
@@ -500,12 +933,15 @@ def align_cam_to_field(imgfiles, cam_R, cam_T, calib, droid_disps, droid_tstamp,
 # Top-level: field-aware metric SLAM  (replaces run_metric_slam for field videos)
 # ---------------------------------------------------------------------------
 
-def run_field_metric_slam(img_folder, masks=None, calib=None, is_static=False):
+def run_field_metric_slam(img_folder, masks=None, calib=None, is_static=False,
+                          use_hoops=False):
     """
     Drop-in replacement for run_metric_slam that uses yard-line spacing
     for metric scale instead of ZoeDepth, and field-plane normal for
     world alignment instead of SPEC.
 
+    :param use_hoops: if True, also attempt hoop-based scale estimation on
+                      each keyframe and pool those estimates with yard-line ones
     :returns: cam_R (T,3,3), cam_T (T,3) in metric scale,
               world_cam_R (T,3,3), world_cam_T (T,3) in field-aligned world frame,
               droid_disps (K,H,W) keyframe disparities,
@@ -572,8 +1008,13 @@ def run_field_metric_slam(img_folder, masks=None, calib=None, is_static=False):
         if s is not None and 0.01 < s < 1000:
             scales.append(s)
 
+        if use_hoops:
+            s_hoop = est_scale_from_hoops(slam_depth, img, calib_slam)
+            if s_hoop is not None and 0.01 < s_hoop < 1000:
+                scales.append(s_hoop)
+
     if len(scales) == 0:
-        print('  WARNING: yard-line scale estimation failed on all keyframes.')
+        print('  WARNING: yard-line/hoop scale estimation failed on all keyframes.')
         print('           Falling back to ZoeDepth scale estimation.')
         from lib.camera.masked_droid_slam import run_metric_slam
         cam_r, cam_t = run_metric_slam(img_folder, masks=masks, calib=calib,
@@ -589,11 +1030,53 @@ def run_field_metric_slam(img_folder, masks=None, calib=None, is_static=False):
     cam_t = slam_cam_t * scale
     cam_r = slam_cam_r
 
-    # --- World alignment from field plane ---
-    print('  Aligning world frame to football field plane ...')
-    world_cam_R, world_cam_T, _ = align_cam_to_field(
-        imgfiles, cam_r, cam_t, calib_slam,
-        disps, tstamp, human_masks=masks, sample_frames=15
+    # --- World alignment from yard-line vanishing point ---
+    # Uses image-only geometry: no SLAM depth needed, works for static/high-angle cameras.
+    print('  Aligning world frame via yard-line vanishing point ...')
+    world_cam_R, world_cam_T, R_wc = align_cam_via_yard_lines(
+        imgfiles, cam_r, cam_t, calib, sample_frames=15
     )
+
+    # --- Height shift: translate so the field surface sits at Y = 0 ---
+    # The rotation above only re-orients the frame; the SLAM origin is camera 0's
+    # position, so the ground is at negative Y.  Back-project a few keyframes of
+    # field pixels (using metric-scale depth) to find where the ground plane is,
+    # then shift world_cam_T so that plane moves to Y = 0.
+    R_wc_np = R_wc.numpy() if torch.is_tensor(R_wc) else np.array(R_wc)
+    ground_ys = []
+    for ki in np.linspace(0, len(tstamp) - 1, min(6, len(tstamp)), dtype=int):
+        t = int(tstamp[ki])
+        img = cv2.imread(imgfiles[t])
+        if img is None:
+            continue
+        # Metric-scale depth: disparity × scale
+        slam_depth_m = np.where(disps[ki] > 0, scale / disps[ki], 0.0)
+        field_mask, found = detect_field_mask(img)
+        if not found:
+            continue
+        hm = None
+        if masks is not None:
+            hm = masks[t].numpy() if torch.is_tensor(masks[t]) else masks[t]
+            if hm is not None:
+                hm_rs = cv2.resize(hm.astype(np.uint8),
+                                   (field_mask.shape[1], field_mask.shape[0]))
+                field_mask = cv2.bitwise_and(field_mask,
+                                             cv2.bitwise_not(hm_rs * 255))
+        pts_cam = get_field_ground_points(img, field_mask, slam_depth_m, calib_slam)
+        if pts_cam.shape[0] < 20:
+            continue
+        # Transform to SLAM world frame then to aligned world frame
+        R_i = cam_r[t].numpy() if torch.is_tensor(cam_r[t]) else cam_r[t]
+        T_i = cam_t[t].numpy() if torch.is_tensor(cam_t[t]) else cam_t[t]
+        pts_slam = (R_i @ pts_cam.T).T + T_i
+        pts_world = (R_wc_np @ pts_slam.T).T
+        ground_ys.append(float(pts_world[:, 1].mean()))
+
+    if ground_ys:
+        ground_y = float(np.median(ground_ys))
+        world_cam_T = world_cam_T.clone()
+        world_cam_T[:, 1] -= ground_y
+        print(f'  Height shift: {ground_y:+.2f} m  (field → Y=0, '
+              f'camera ~{-ground_y:.1f} m above ground)')
 
     return cam_r, cam_t, world_cam_R, world_cam_T, disps, tstamp
