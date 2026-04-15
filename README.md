@@ -44,16 +44,23 @@ bash scripts/download_models.sh
 This project integrates the complete 4D human system, including tracking, slam, and 4D human capture in the world space. We separate the core functionalities into different scripts, which should be run **sequentially**. Each step will save its result to be used by the next step. All results will be saved in a folder with the same name as the video.
 
 ```bash
+conda run -n 4dhumans python scripts/phalp_track.py --video Ravens_trimmed/video.mp4
+conda run -n tram python scripts/estimate_camera.py --video Ravens_trimmed/video.mp4 --field_mode
+conda run -n tram python scripts/estimate_humans.py --video Ravens_trimmed/video.mp4
+
 # 1. Run Masked Droid SLAM (also detect+track humans in this step)
-python scripts/estimate_camera.py --video "./example_video.mov" 
+python scripts/estimate_camera.py --video "./example_video.mov" --field_mode
 # -- You can indicate if the camera is static. The algorithm will try to catch it as well.
 python scripts/estimate_camera.py --video "./another_video.mov" --static_camera
 
 # 2. Run 4D human capture with VIMO.
+# NEW: Replace DEVA tracks with PHALP tracks
+conda run -n 4dhumans python scripts/phalp_track.py --video path/to/video.mp4
+
 python scripts/estimate_humans.py --video "./example_video.mov"
 
 # 3. Put everything together. Render the output video.
-python scripts/visualize_tram.py --video "./example_video.mov"
+python scripts/visualize_tram.py --video "./example_video.mov" --field_mode
 ```
 
 Running the above three scripts on the provided video `./example_video.mov` will create a folder `./results/exapmle_video` and save all results in it. Please see available arguments in the scripts.
