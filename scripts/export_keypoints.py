@@ -12,10 +12,10 @@ Previously-completed steps are detected by their output files and skipped,
 so re-running the script on a partially-processed folder is safe.
 
 Usage (single video):
-    conda run -n tram python scripts/export_keypoints.py --video Ravens_trimmed/2022_BARNO_AMARE_DL25.mp4 --field_mode
+    conda run -n tram python scripts/export_keypoints.py --video Ravens_trimmed/2022_BARNO_AMARE_DL25.mp4
 
 Usage (all videos in a folder):
-    conda run -n tram python scripts/export_keypoints.py --video_dir Ravens_trimmed/ --out_dir keypoints/ --field_mode
+    conda run -n tram python scripts/export_keypoints.py --video_dir Ravens_trimmed/ --out_dir keypoints/
 
 Optional flags passed through to estimate_camera.py:
     --field_mode        use yard-line scale + field-plane alignment
@@ -27,7 +27,11 @@ Output format matches 2022_BARNO_AMARE_DL25.json:
   "year": 2022,
   "n_keypoints": 45,
   "athlete_frames": [
-    {"frame": 0, "keypoints": [[x, y, z], ...]},   // 45 world-space 3D joints
+    {
+      "frame": 0,
+      "keypoints": [[u, v], ...],        // 45 image-space 2D joints (pixels)
+      "keypoints_3d": [[x, y, z], ...]   // 45 world-space 3D joints (metres)
+    },
     ...
   ]
 }
@@ -184,7 +188,7 @@ def run_pipeline(video_path, seq_folder, field_mode=False, static_camera=False,
 # ---------------------------------------------------------------------------
 
 def export_keypoints(seq_folder, smpl_model, device='cuda'):
-    """Compute world-space 3D keypoints for the primary human track.
+    """Compute 2D image-space and 3D world-space keypoints for the primary human track.
 
     Returns (athlete_frames, n_keypoints) or None on error.
     """
@@ -201,6 +205,8 @@ def export_keypoints(seq_folder, smpl_model, device='cuda'):
 
     world_cam_R = torch.tensor(cam['world_cam_R'], dtype=torch.float32).to(device)
     world_cam_T = torch.tensor(cam['world_cam_T'], dtype=torch.float32).to(device)
+    focal       = float(cam['img_focal'])
+    cx, cy      = float(cam['img_center'][0]), float(cam['img_center'][1])
 
     # Average shape across the track for temporal stability (matches visualizer)
     mean_shape = pred_shape.mean(dim=0, keepdim=True).expand_as(pred_shape)
@@ -216,16 +222,29 @@ def export_keypoints(seq_folder, smpl_model, device='cuda'):
             default_smpl=True,
         )
 
+    # 2D projection: pinhole model in SMPL camera space
+    # pred.joints shape: (N, 45, 3)  — x/y/z in camera space
+    joints_cam = pred.joints                                         # (N, 45, 3)
+    u = focal * joints_cam[..., 0] / joints_cam[..., 2] + cx        # (N, 45)
+    v = focal * joints_cam[..., 1] / joints_cam[..., 2] + cy        # (N, 45)
+    joints_2d = torch.stack([u, v], dim=-1).cpu().numpy()           # (N, 45, 2)
+
     # Transform from SMPL camera space → scene world space
     cam_r = world_cam_R[frame]   # (N, 3, 3)
     cam_t = world_cam_T[frame]   # (N, 3)
-    joints_world = torch.einsum('bij,bnj->bni', cam_r, pred.joints) + cam_t[:, None]
-    joints_world = joints_world.cpu().numpy()    # (N, 45, 3)
+    joints_world = torch.einsum('bij,bnj->bni', cam_r, joints_cam) + cam_t[:, None]
+    joints_world = joints_world.cpu().numpy()                        # (N, 45, 3)
+
+    # Free GPU tensors as soon as we have the numpy results
+    del pred_rotmat, pred_shape, pred_trans, mean_shape
+    del world_cam_R, world_cam_T, cam_r, cam_t, pred, joints_cam, u, v
+    torch.cuda.empty_cache()
 
     athlete_frames = []
     for i, f in enumerate(frame.tolist()):
-        kp = [[round(v, 4) for v in pt] for pt in joints_world[i].tolist()]
-        athlete_frames.append({'frame': int(f), 'keypoints': kp})
+        kp_2d = [[round(v, 2) for v in pt] for pt in joints_2d[i].tolist()]
+        kp_3d = [[round(pt[2], 4), round(pt[1], 4), round(pt[0], 4)] for pt in joints_world[i].tolist()]
+        athlete_frames.append({'frame': int(f), 'keypoints': kp_2d, 'keypoints_3d': kp_3d})
 
     athlete_frames.sort(key=lambda e: e['frame'])
     return athlete_frames, int(joints_world.shape[1])
@@ -303,9 +322,15 @@ def main():
             torch.cuda.empty_cache()
             continue
 
-        # Free SMPL before the next video's pipeline runs
+        # Free SMPL before the next video's pipeline runs.
+        # _flush_gpu() is essential here: torch.cuda.empty_cache() frees
+        # PyTorch's allocator but the Windows driver may not reclaim VRAM
+        # immediately. Without this flush the next video's subprocess
+        # (PHALP / DROID-SLAM) launches while VRAM is still partially
+        # occupied, which can cause an OOM that crashes the system.
         del smpl
         torch.cuda.empty_cache()
+        _flush_gpu()
 
         # Align starting frame to the reference file when one exists
         ref_path = os.path.join(ROOT_DIR, args.ref_dir, f'{seq}.json')

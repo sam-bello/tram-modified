@@ -6,13 +6,64 @@ sys.path.insert(0, os.path.dirname(__file__) + '/..')
 if sys.platform == 'win32':
     conda_prefix = os.environ.get('CONDA_PREFIX', '')
     for p in [os.path.join(conda_prefix, 'bin'),
-              os.path.join(conda_prefix, 'Library', 'bin')]:
+              os.path.join(conda_prefix, 'Library', 'bin'),
+              os.path.join(conda_prefix, 'Lib', 'site-packages', 'numpy', '.libs')]:
         if os.path.isdir(p):
             os.add_dll_directory(p)
 
 import torch
 import argparse
 import numpy as np
+
+# NumPy 2.x + PyTorch 2.4 ABI workaround: torch.from_numpy / torch.as_tensor fail
+# because PyTorch was compiled against NumPy 1.x. Replace both with a frombuffer
+# path that avoids the strict C-level type check. Covers all lib calls from this script.
+def _np_to_tensor(arr):
+    _dtype_map = {
+        'float16': torch.float16, 'float32': torch.float32, 'float64': torch.float64,
+        'int8': torch.int8, 'int16': torch.int16, 'int32': torch.int32, 'int64': torch.int64,
+        'uint8': torch.uint8, 'uint16': torch.int16, 'bool': torch.bool,
+    }
+    arr = np.ascontiguousarray(arr)
+    dt = _dtype_map[str(arr.dtype)]
+    return torch.frombuffer(bytearray(arr.tobytes()), dtype=dt).reshape(arr.shape)
+
+_orig_from_numpy = torch.from_numpy
+def _from_numpy_compat(arr):
+    try:
+        return _orig_from_numpy(arr)
+    except TypeError:
+        return _np_to_tensor(arr)
+torch.from_numpy = _from_numpy_compat
+
+_orig_as_tensor = torch.as_tensor
+def _as_tensor_compat(data, dtype=None, device=None):
+    try:
+        return _orig_as_tensor(data, dtype=dtype, device=device)
+    except (TypeError, RuntimeError):
+        if hasattr(data, 'dtype'):  # numpy array
+            t = _np_to_tensor(data)
+            if dtype is not None:
+                t = t.to(dtype)
+            if device is not None:
+                t = t.to(device)
+            return t
+        raise
+torch.as_tensor = _as_tensor_compat
+
+# NumPy 2.x: numpy scalar types (int64, float64, etc.) no longer subclass Python
+# Number, so torch.arange(np.int64) raises TypeError. Convert any numpy scalar
+# arguments to their Python equivalents first.
+def _to_py_scalar(x):
+    return x.item() if hasattr(x, 'item') and not isinstance(x, torch.Tensor) else x
+
+_orig_arange = torch.arange
+def _arange_compat(*args, **kwargs):
+    args = tuple(_to_py_scalar(a) for a in args)
+    kwargs = {k: _to_py_scalar(v) for k, v in kwargs.items()}
+    return _orig_arange(*args, **kwargs)
+torch.arange = _arange_compat
+
 import cv2
 from glob import glob
 from pycocotools import mask as masktool
@@ -67,7 +118,7 @@ masks_phalp_path = f'{seq_folder}/masks_phalp.npy'
 if os.path.exists(masks_phalp_path):
     _log('STEP load_phalp_masks (DEVA skipped)')
     phalp_arr = np.load(masks_phalp_path)        # (N, H, W) uint8
-    masks = torch.from_numpy(phalp_arr)
+    masks = torch.frombuffer(bytearray(phalp_arr.tobytes()), dtype=torch.uint8).reshape(phalp_arr.shape)
     _log(f'  PHALP masks loaded: {masks.shape}')
 
     # Placeholder boxes/masks/tracks — estimate_humans.py uses tracks_phalp.pkl
@@ -89,7 +140,7 @@ else:
 
     _log('STEP prepare_masks')
     masks = np.array([masktool.decode(m) for m in masks_])
-    masks = torch.from_numpy(masks)
+    masks = torch.frombuffer(bytearray(masks.tobytes()), dtype=torch.uint8).reshape(masks.shape)
     _log(f'  masks shape: {masks.shape}')
 
 _log('STEP calibrate_intrinsics')
