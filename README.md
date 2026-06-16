@@ -183,8 +183,7 @@ Produces `results/{seq}/tram_output.mp4`.
 
 ```bash
 conda run -n tram python scripts/export_keypoints.py \
-    --video Ravens_trimmed/2022_BARNO_AMARE_DL25.mp4 \
-    --field_mode
+    --video Ravens_trimmed/2022_BARNO_AMARE_DL25.mp4 
 ```
 
 ### Folder of videos
@@ -192,8 +191,7 @@ conda run -n tram python scripts/export_keypoints.py \
 ```bash
 conda run -n tram python scripts/export_keypoints.py \
     --video_dir Ravens_trimmed/ \
-    --out_dir keypoints/ \
-    --field_mode
+    --out_dir keypoints/
 ```
 
 | Flag | Default | Description |
