@@ -2,6 +2,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__) + '/..')
 
+import pickle
 import torch
 import argparse
 import numpy as np
@@ -29,7 +30,16 @@ os.makedirs(hps_folder, exist_ok=True)
 ##### Preprocess results from estimate_camera.py #####
 imgfiles = sorted(glob(f'{img_folder}/*.jpg'))
 camera = np.load(f'{seq_folder}/camera.npy', allow_pickle=True).item()
-tracks = np.load(f'{seq_folder}/tracks.npy', allow_pickle=True).item()
+
+# Prefer PHALP tracks when available (saved by scripts/phalp_track.py),
+# otherwise fall back to the DEVA tracks from estimate_camera.py.
+phalp_pkl = f'{seq_folder}/tracks_phalp.pkl'
+if os.path.exists(phalp_pkl):
+    print(f'Using PHALP tracks: {phalp_pkl}')
+    with open(phalp_pkl, 'rb') as _f:
+        tracks = pickle.load(_f)
+else:
+    tracks = np.load(f'{seq_folder}/tracks.npy', allow_pickle=True).item()
 
 img_focal = camera['img_focal']
 img_center = camera['img_center']

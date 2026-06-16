@@ -1,3 +1,4 @@
+import gc
 import cv2
 from tqdm import tqdm
 import numpy as np
@@ -66,9 +67,15 @@ def detect_segment_track(imgfiles, out_path, thresh=0.5, min_size=None,
     # Run
     masks_ = []
     boxes_ = []
+    n_frames = len(imgfiles)
+    # initialise mask so frame-0 no-detection path has a valid value
+    mask = None
     for t, imgpath in enumerate(tqdm(imgfiles)):
-        if t % 20 == 0:
+        if t % 10 == 0:
             torch.cuda.empty_cache()
+            gc.collect()
+        if t % 50 == 0:
+            print(f'  [detect_segment_track] frame {t}/{n_frames}', flush=True)
         img_cv2 = cv2.imread(imgpath)
 
         ### --- Detection ---
@@ -79,48 +86,56 @@ def detect_segment_track(imgfiles, out_path, thresh=0.5, min_size=None,
                 valid_idx = (det_instances.pred_classes==0) & (det_instances.scores > thresh)
                 boxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
                 confs = det_instances.scores[valid_idx].cpu().numpy()
+                del det_out, det_instances, valid_idx
 
                 boxes = np.hstack([boxes, confs[:, None]])
                 boxes = arrange_boxes(boxes, mode='size', min_size=min_size)
 
-        ### --- SAM --- 
-        if len(boxes)>0:
+        ### --- SAM ---
+        if len(boxes) > 0:
             with autocast('cuda'):
                 predictor.set_image(img_cv2, image_format='BGR')
 
-                # multiple boxes
                 bb = torch.tensor(boxes[:, :4]).cuda()
-                bb = predictor.transform.apply_boxes_torch(bb, img_cv2.shape[:2])  
+                bb = predictor.transform.apply_boxes_torch(bb, img_cv2.shape[:2])
                 masks, scores, _ = predictor.predict_torch(
                     point_coords=None,
                     point_labels=None,
                     boxes=bb,
                     multimask_output=False
                 )
+                del bb
                 scores = scores.cpu()
                 masks = masks.cpu().squeeze(1)
                 mask = masks.sum(dim=0)
+                predictor.reset_image()
         else:
-            mask = np.zeros_like(mask)
+            h, w = img_cv2.shape[:2]
+            mask = torch.zeros((h, w), dtype=torch.uint8)
+            masks = torch.zeros((0, h, w), dtype=torch.bool)
+            scores = torch.zeros((0,))
 
         ### --- DEVA ---
-        if len(boxes)>0 and (boxes[:, -1] > 0.80).sum()>0:
-            track_valid = boxes[:, -1] > 0.80    # only use high-confident
+        if len(boxes) > 0 and (boxes[:, -1] > 0.80).sum() > 0:
+            track_valid = boxes[:, -1] > 0.80
             masks_track = masks[track_valid]
             scores_track = scores[track_valid]
         else:
-            masks_track = torch.zeros([1,img_cv2.shape[0],img_cv2.shape[1]])
+            masks_track = torch.zeros([1, img_cv2.shape[0], img_cv2.shape[1]])
             scores_track = torch.zeros([1])
 
         with autocast('cuda'):
             img_rgb = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2RGB)
-            track_with_mask(deva, masks_track, scores_track, img_rgb, 
+            track_with_mask(deva, masks_track, scores_track, img_rgb,
                             imgpath, result_saver, t, save_vos)
-            
+
+        del masks_track, scores_track, masks, scores, img_cv2, img_rgb
+
         ### Record full mask and boxes
         mask_bit = masktool.encode(np.asfortranarray(mask > 0))
         masks_.append(mask_bit)
         boxes_.append(boxes)
+        del mask
 
     with autocast('cuda'):
         flush_buffer(deva, result_saver)

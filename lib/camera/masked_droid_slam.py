@@ -195,21 +195,25 @@ def test_slam(imagedir, masks, calib, stride=10, max_frame=50):
     args.disable_vis = True
     args.frontend_window = 10
     args.frontend_thresh = 10
+    # Use a small buffer — this function only sees max_frame=50 frames so the
+    # default 512-keyframe buffer wastes ~10x the VRAM it needs.  This matters
+    # because calibrate_intrinsics() calls test_slam up to 11 times in a loop.
+    args.buffer = max_frame
     droid = None
 
     for (t, image, intrinsics) in image_stream(imagedir, calib, stride, max_frame):
         if droid is None:
             args.image_size = [image.shape[2], image.shape[3]]
             droid = Droid(args)
-        
+
         if masks is not None:
             img_msk = masks[0][t]
             conf_msk = masks[1][t]
             image = image * (img_msk < 0.5)
-            droid.track(t, image, intrinsics=intrinsics, mask=conf_msk)  
+            droid.track(t, image, intrinsics=intrinsics, mask=conf_msk)
         else:
-            droid.track(t, image, intrinsics=intrinsics, mask=None)  
-    
+            droid.track(t, image, intrinsics=intrinsics, mask=None)
+
     if droid.video.counter.value <= 1:
         # If less than 2 keyframes, likely static camera
         static_camera = True
@@ -219,6 +223,7 @@ def test_slam(imagedir, masks, calib, stride=10, max_frame=50):
         reprojection_error = droid.compute_error()
 
     del droid
+    torch.cuda.empty_cache()
 
     return reprojection_error, static_camera
 

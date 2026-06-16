@@ -92,7 +92,7 @@ def get_frame_range(json_path):
     with open(json_path) as f:
         data = json.load(f)
     frames = [entry['frame'] for entry in data['athlete_frames']]
-    return min(frames), max(frames)
+    return min(frames), max(frames)-50  # trim a bit of extra frames at the end to be safe (some JSONs have a few extra frames beyond the main action)
 
 
 def trim_video(input_path, output_path, start_frame, end_frame):
