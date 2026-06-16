@@ -1,116 +1,274 @@
-## :railway_car: TRAM 
-Official implementation for the paper: \
-**TRAM: Global Trajectory and Motion of 3D Humans from in-the-wild Videos**  
-[Yufu Wang](https://yufu-wang.github.io), [Ziyun Wang](https://ziyunclaudewang.github.io/), [Lingjie Liu](https://lingjie0206.github.io/), [Kostas Daniilidis](https://www.cis.upenn.edu/~kostas/)\
-[[Project Page](https://yufu-wang.github.io/tram4d/)]
+# TRAM — 3D Human Trajectory & Motion from Video
 
-<img src="data/teaser.jpg" width="700">
+Fork of the official [TRAM](https://yufu-wang.github.io/tram4d/) implementation, extended for football video analysis:
+- **PHALP-based tracking** (replaces DEVA) for more robust player re-identification
+- **Field-mode camera alignment** using yard-line geometry (Experimental)
+- **Batch keypoint export** to world-space 3D JSON
 
-https://github.com/yufu-wang/tram/assets/26578575/e857366a-4b51-42ff-bd16-07d800455015
+---
 
-## Updates
-- [2025/06] TRAM is integrated in our new work, [PromptHMR](https://github.com/yufu-wang/PromptHMR). Please check it out!
-- [2025/02] Add training code and preprocessed data.
-- [2025/02] Update with better gravity & floor prediction. Add EMDB evaluation.
-- [2024/04] Initial release.
+## Table of Contents
+- [Overview](#overview)
+- [Installation](#installation)
+- [Data Setup](#data-setup)
+- [Running the Pipeline](#running-the-pipeline)
+- [Batch Export (export_keypoints.py)](#batch-export)
+- [Keypoint Output Format](#keypoint-output-format)
+- [Individual Scripts Reference](#individual-scripts-reference)
+- [Training](#training)
+- [Evaluation (EMDB)](#evaluation)
+
+---
+
+## Overview
+
+The pipeline reconstructs world-space 3D human motion from a single monocular video in four steps:
+
+```
+Video
+  │
+  ▼
+phalp_track.py        [4dhumans env]  ── human detection + tracking → masks_phalp.npy
+  │
+  ▼
+estimate_camera.py    [tram env]      ── masked DROID-SLAM + metric depth → camera.npy
+  │
+  ▼
+estimate_humans.py    [tram env]      ── HMR-VIMO pose/shape estimation → hps/hps_track_0.npy
+  │
+  ▼
+export_keypoints.py   [tram env]      ── 45 world-space 3D joints → {seq}.json
+```
+
+All results are written to `results/{video_name}/`.
+
+---
 
 ## Installation
-1. Clone this repo with the `--recursive` flag.
-```Bash
-git clone --recursive https://github.com/yufu-wang/tram
+
+### Prerequisites
+- Anaconda or Miniconda
+- CUDA-capable GPU (tested with CUDA 11.8 / 12.x)
+- Windows or Linux (Windows path noted where relevant)
+
+### 1. Clone the repo
+
+```bash
+git clone --recursive https://github.com/your-fork/tram
+cd tram
 ```
-2. Creating a new anaconda environment.
-```Bash
+
+### 2. Create the `tram` environment
+
+```bash
 conda create -n tram python=3.10 -y
 conda activate tram
 bash install.sh
 ```
-3. Compile DROID-SLAM. If you encountered difficulty in this step, please refer to its [official release](https://github.com/princeton-vl/DROID-SLAM) for more info. In this project, DROID is modified to support masking. 
-```Bash
+
+Then compile the modified DROID-SLAM (required for masked SLAM):
+
+```bash
 cd thirdparty/DROID-SLAM
 python setup.py install
 cd ../..
 ```
 
-## Prepare data
-Register at [SMPLify](https://smplify.is.tue.mpg.de) and [SMPL](https://smpl.is.tue.mpg.de), whose usernames and passwords will be used by our script to download the SMPL models. In addition, we will fetch trained checkpoints and an example video. Note that thirdparty models have their own licenses. 
+**Windows note:** If you see `RuntimeError: Numpy is not available` or `TypeError: expected np.ndarray` when running scripts, pin NumPy and OpenCV to compatible versions:
 
-Run the following to fetch all models and checkpoints to `data/`. It also downloads `example_video.mov` for the demo.
-```Bash
+```bash
+pip install "numpy==1.26.4" "opencv-python==4.9.0.80" --force-reinstall
+```
+
+### 3. Create the `4dhumans` environment
+
+The PHALP tracking step runs in a separate environment. Follow the [4D-Humans installation guide](https://github.com/shubham-goel/4D-Humans) to create the `4dhumans` conda environment, then install PHALP into it:
+
+```bash
+conda activate 4dhumans
+pip install phalp[all]
+```
+
+---
+
+## Data Setup
+
+Register at [SMPLify](https://smplify.is.tue.mpg.de) and [SMPL](https://smpl.is.tue.mpg.de). The download script uses those credentials to fetch the SMPL body models.
+
+```bash
+conda activate tram
 bash scripts/download_models.sh
 ```
 
-## Run demo on videos
-This project integrates the complete 4D human system, including tracking, slam, and 4D human capture in the world space. We separate the core functionalities into different scripts, which should be run **sequentially**. Each step will save its result to be used by the next step. All results will be saved in a folder with the same name as the video.
+This populates `data/` with:
+- `data/smpl/` — SMPL body model (NEUTRAL, MALE, FEMALE)
+- `data/pretrain/` — DROID-SLAM, SAM, DEVA, VIMO, and camera calibration checkpoints
+- `example_video.mov` — sample video for testing
+
+---
+
+## Running the Pipeline
+
+Run each step sequentially. Each step detects previously-generated outputs and skips completed steps automatically.
+
+### Step 1 — Human tracking (4dhumans env)
 
 ```bash
-conda run -n 4dhumans python scripts/phalp_track.py --video Ravens_trimmed/video.mp4
-conda run -n tram python scripts/estimate_camera.py --video Ravens_trimmed/video.mp4 --field_mode
-conda run -n tram python scripts/estimate_humans.py --video Ravens_trimmed/video.mp4
-
-# 1. Run Masked Droid SLAM (also detect+track humans in this step)
-python scripts/estimate_camera.py --video "./example_video.mov" --field_mode
-# -- You can indicate if the camera is static. The algorithm will try to catch it as well.
-python scripts/estimate_camera.py --video "./another_video.mov" --static_camera
-
-# 2. Run 4D human capture with VIMO.
-# NEW: Replace DEVA tracks with PHALP tracks
 conda run -n 4dhumans python scripts/phalp_track.py --video path/to/video.mp4
-
-python scripts/estimate_humans.py --video "./example_video.mov"
-
-# 3. Put everything together. Render the output video.
-python scripts/visualize_tram.py --video "./example_video.mov" --field_mode
 ```
 
-Running the above three scripts on the provided video `./example_video.mov` will create a folder `./results/exapmle_video` and save all results in it. Please see available arguments in the scripts.
+Outputs to `results/{seq}/`:
+- `tracks_phalp.pkl` — per-frame track data
+- `masks_phalp.npy` — binary masks used to exclude humans from SLAM
 
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--video` | *(required)* | Path to the input video |
+| `--max_age` | `50` | Frames to keep a track alive without a detection |
 
-## Evaluation
-You can run inference and evaluation from scratch on EMDB as follow.
+### Step 2 — Camera estimation (tram env)
 
 ```bash
-# Inference and evaluation (saves results in "results/emdb")
-bash scripts/emdb/run.sh
+conda run -n tram python scripts/estimate_camera.py --video path/to/video.mp4 [flags]
 ```
 
-You can also download our saved results [here](https://drive.google.com/drive/folders/1ghLfoFpaoi1SHnYJSM1iaOFzetwLkHD8?usp=sharing), skipping the inference, and run evaluation directly as follow.
+Outputs to `results/{seq}/`:
+- `camera.npy` — per-frame camera rotation, translation, focal length, world alignment
+
+| Flag | Description |
+|------|-------------|
+| `--static_camera` | Treat the camera as stationary (skips SLAM motion estimation) |
+| `--field_mode` (Experimental: only works for some videos) | Use football yard lines (5 yd spacing) to compute metric scale and align the world coordinate frame so the field surface is Y=0 | 
+| `--hoop_mode` (Experimental: only works for some videos) | Supplement yard-line scale with training hoops (requires `--field_mode`) |
+| `--yard_line_align` (Experimental: only works for some videos) | Use yard-line vanishing point for world alignment instead of SPEC gravity (better for high-angle end-zone cameras) |
+| `--visualize_mask` | Save DEVA masks as visualizations |
+
+**Typical football usage:**
 ```bash
-# Evaluation only 
-python scripts/emdb/run_eval.py --split 2 --input_dir "results/emdb"
+conda run -n tram python scripts/estimate_camera.py \
+    --video Ravens_trimmed/2022_BARNO_AMARE_DL25.mp4 \
+    --field_mode
 ```
 
+### Step 3 — Human pose estimation (tram env)
 
-
-## Training 
-**Data**. We provide the preprocessed data (e.g. crops) and annotations [HERE](https://drive.google.com/drive/folders/1kTrsfZRfWjZOnwNn-5OOyvmVCCXoGBUG?usp=share_link), except for [BEDLAM](https://bedlam.is.tue.mpg.de) (30fps). Please download our preprocessed data and edit **data_config.py** to point to the right paths. For BEDLAM, please download the 30fps version (e.g. the mp4), and use **scripts/extract_bedlam_jpg.py** and **scripts/crop_datasets.py** to process it to the correct format. Please submit an issue if you run into troubles in this step.
-
-**Checkpoint**. Run this command to download the HMR2b checkpoint as our initialization.
 ```bash
-bash scripts/download_pretrain.sh
+conda run -n tram python scripts/estimate_humans.py --video path/to/video.mp4
 ```
 
-**Training**.
+Outputs to `results/{seq}/hps/`:
+- `hps_track_0.npy` — pose (24×3×3 rotation matrices), shape (10 betas), translation per frame for the primary track
+- Additional files for each tracked person
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--video` | `./example_video.mov` | Path to the input video |
+| `--max_humans` | `20` | Maximum number of people to reconstruct |
+
+### Step 4 — Visualize (optional)
+
 ```bash
-python train.py --cfg configs/config_vimo.yaml
+conda run -n tram python scripts/visualize_tram.py --video path/to/video.mp4 [--field_mode]
 ```
-Results will be save under **results/EXP_NAME**. 
 
+Produces `results/{seq}/tram_output.mp4`.
+
+---
+
+## Batch Export
+
+`export_keypoints.py` runs the full 4-step pipeline for one video or a folder of videos, automatically skipping steps whose outputs already exist, and writes 3D keypoints to JSON.
+
+### Single video
+
+```bash
+conda run -n tram python scripts/export_keypoints.py \
+    --video Ravens_trimmed/2022_BARNO_AMARE_DL25.mp4 \
+    --field_mode
+```
+
+### Folder of videos
+
+```bash
+conda run -n tram python scripts/export_keypoints.py \
+    --video_dir Ravens_trimmed/ \
+    --out_dir keypoints/ \
+    --field_mode
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--video` | — | Single video path (mutually exclusive with `--video_dir`) |
+| `--video_dir` | — | Directory of `.mp4` files |
+| `--out_dir` | `keypoints/` | Output directory for JSON files |
+| `--field_mode` | off | Passed through to `estimate_camera.py` |
+| `--hoop_mode` | off | Passed through to `estimate_camera.py` (requires `--field_mode`) |
+| `--static_camera` | off | Passed through to `estimate_camera.py` |
+| `--ref_dir` | `pose_json_3d_45_4dhumans/` | Directory of reference JSONs used to align starting frame numbers |
+| `--device` | `cuda` | PyTorch device |
+
+**Frame alignment:** If a reference JSON exists in `--ref_dir` for a given video, the output frame numbers are offset so the first frame matches the reference. This is used to align TRAM output with existing 4D-Humans annotations.
+
+---
+
+## Keypoint Output Format
+
+Each JSON file contains 45 SMPL joints per frame in both image space (pixels) and world space (metres).
+
+```json
+{
+  "player_id": "2022_BARNO_AMARE_DL25",
+  "year": 2022,
+  "n_keypoints": 45,
+  "athlete_frames": [
+    {
+      "frame": 0,
+      "keypoints":    [[u, v], ...],       // 45 × 2  image-space pixels
+      "keypoints_3d": [[x, y, z], ...]     // 45 × 3  world-space metres
+    },
+    ...
+  ]
+}
+```
+
+**Coordinate conventions:**
+- `keypoints` — pinhole projection into the original image, origin at top-left
+- `keypoints_3d` — world frame set by field-mode alignment: field surface is Y=0, camera is at positive Y. Axes stored as `[z, y, x]` (depth-first order)
+- When `--field_mode` is not used, the world frame origin and scale are SLAM-relative (metric scale from ZoeDepth, but no absolute ground reference)
+
+**Joint ordering** follows the 45-joint raw SMPL-X convention (`default_smpl=True` in the SMPL wrapper).
+
+---
+
+## Individual Scripts Reference
+
+| Script | Env | Purpose |
+|--------|-----|---------|
+| `scripts/phalp_track.py` | 4dhumans | PHALP human tracking |
+| `scripts/estimate_camera.py` | tram | Masked DROID-SLAM + metric scale |
+| `scripts/estimate_humans.py` | tram | HMR-VIMO pose & shape estimation |
+| `scripts/visualize_tram.py` | tram | Render world-space output video |
+| `scripts/export_keypoints.py` | tram | Full pipeline + JSON keypoint export |
+| `scripts/emdb/run.sh` | tram | EMDB benchmark inference |
+| `scripts/emdb/run_eval.py` | tram | EMDB evaluation metrics |
+| `scripts/extract_bedlam_jpg.py` | tram | Extract frames from BEDLAM videos |
+| `scripts/crop_datasets.py` | tram | Crop person bounding boxes for training |
+---
 
 ## Acknowledgements
-We benefit greatly from the following open source works, from which we adapted parts of our code.
-- [WHAM](https://github.com/yohanshin/WHAM): visualization and evaluation
-- [HMR2.0](https://github.com/shubham-goel/4D-Humans): baseline backbone
-- [DROID-SLAM](https://github.com/princeton-vl/DROID-SLAM): baseline SLAM
-- [ZoeDepth](https://github.com/isl-org/ZoeDepth): metric depth prediction
-- [BEDLAM](https://github.com/pixelite1201/BEDLAM): large-scale video dataset
-- [EMDB](https://github.com/eth-ait/emdb): evaluation dataset
 
-In addition, the pipeline includes [Detectron2](https://github.com/facebookresearch/detectron2), [Segment-Anything](https://github.com/facebookresearch/segment-anything), and [DEVA-Track-Anything](https://github.com/hkchengrex/Tracking-Anything-with-DEVA).
+- [TRAM (original)](https://github.com/yufu-wang/tram) — Yufu Wang et al.
+- [DROID-SLAM](https://github.com/princeton-vl/DROID-SLAM) — baseline SLAM
+- [ZoeDepth](https://github.com/isl-org/ZoeDepth) — metric depth
+- [4D-Humans / HMR2.0](https://github.com/shubham-goel/4D-Humans) — backbone
+- [PHALP](https://github.com/brjathu/PHALP) — 3D tracking
+- [DEVA-Track-Anything](https://github.com/hkchengrex/Tracking-Anything-with-DEVA) — video segmentation
+- [Detectron2](https://github.com/facebookresearch/detectron2), [SAM](https://github.com/facebookresearch/segment-anything), [WHAM](https://github.com/yohanshin/WHAM), [BEDLAM](https://github.com/pixelite1201/BEDLAM), [EMDB](https://github.com/eth-ait/emdb)
 
+---
 
-  
 ## Citation
+
 ```bibtex
 @article{wang2024tram,
   title={TRAM: Global Trajectory and Motion of 3D Humans from in-the-wild Videos},
@@ -119,4 +277,3 @@ In addition, the pipeline includes [Detectron2](https://github.com/facebookresea
   year={2024}
 }
 ```
-
